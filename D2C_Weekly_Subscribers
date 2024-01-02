@@ -1,0 +1,117 @@
+/* New Subscriptions - do not include reactivations  */
+WITH Subs_past_5_weeks AS (
+SELECT subscription_id,
+       plan_interval_count,
+      date_trunc('WEEK', first_paid_timestamp) AS Week_Start,
+      date_trunc('MONTH', first_paid_timestamp) AS Month_Start,
+      first_paid_timestamp as reporting_subscription_start_time,
+      subscription_end_time,
+      'subscription' as label,
+      s.user_id, 
+      CASE WHEN cr.market = '3. EUROPE-LATAM' THEN 'EU-LATAM' ELSE  substr(cr.market, 3, len(cr.market)) END AS reporting_market,
+      cr.country,
+      u.utm_source,
+      u.utm_medium,
+      plan_group 
+FROM perlego_reporting_layer.prod.fct__subscriptions as s 
+LEFT JOIN perlego_reporting_layer.prod.dim__users as u ON s.user_id = u.user_id
+LEFT JOIN perlego_reporting_layer.prod.dim__country_regions as cr ON cr.country_id = u.acquisition_country_id
+WHERE DATE(first_paid_timestamp) between date_add(week, -5, date(now())) and date(now())
+and subscription_type = 'subscribed'
+and payment_channel = 'direct'
+AND s.is_dummy_subscription = false
+AND s.user_id NOT IN (SELECT user_id 
+                      FROM perlego_reporting_layer.prod.fct__subscriptions
+                      WHERE subscription_type = 'subscribed'
+                      AND payment_channel = 'direct'
+                      AND is_dummy_subscription = false
+                      AND first_paid_timestamp < date_add(week, -5, date(now())))
+),
+
+/* Determine first subscription payments gbp amount */
+
+First_subscription_paid_charge AS (
+SELECT subscription_id, amount_gbp
+FROM (
+SELECT i.subscription_id, amount_gbp,
+       ROW_NUMBER() OVER (PARTITION BY i.subscription_id ORDER BY c.Created) as paid_charge_order
+FROM perlego_reporting_layer.prod.int__invoices as i 
+LEFT JOIN perlego_reporting_layer.prod.int__charges as c ON c.id = i.charge_id
+WHERE c.is_paid = true
+and c.is_refunded = false
+AND i.subscription_id IN (SELECT subscription_id FROM Subs_past_5_weeks))
+WHERE paid_charge_order = 1 
+),
+
+/* Create subs payment fields. Trials records will be marked as zero.   */
+
+Subs_past_5_weeks_payments AS (
+SELECT Subs_past_5_weeks.*, 
+       amount_gbp AS payments_gbp,
+       1.0 * amount_gbp / plan_interval_count AS gbp_m1
+FROM Subs_past_5_weeks
+LEFT JOIN First_subscription_paid_charge ON First_subscription_paid_charge.subscription_id = Subs_past_5_weeks.subscription_id
+),
+
+/* add in trial users  */
+
+Trials_past_5_weeks AS (
+
+SELECT subscription_id,
+       plan_interval_count,
+      date_trunc('WEEK', subscription_start_time) AS Week_Start,
+      date_trunc('MONTH', subscription_start_time) AS Month_Start,
+      subscription_start_time as reporting_subscription_start_time,
+      subscription_end_time,
+      'trial' as label,
+      s.user_id, 
+      CASE WHEN cr.market = '3. EUROPE-LATAM' THEN 'EU-LATAM' ELSE  substr(cr.market, 3, len(cr.market)) END AS reporting_market,
+      cr.country,
+      u.utm_source,
+      u.utm_medium,
+      plan_group,
+      0 AS payments_gbp,
+      0 AS gbp_m1
+FROM perlego_reporting_layer.prod.fct__subscriptions as s 
+LEFT JOIN perlego_reporting_layer.prod.dim__users as u ON s.user_id = u.user_id
+LEFT JOIN perlego_reporting_layer.prod.dim__country_regions as cr ON cr.country_id = u.acquisition_country_id
+WHERE DATE(s.subscription_start_time) between date_add(week, -5, date(now())) and date(now())
+and subscription_type = 'trial'
+and payment_channel = 'direct'
+AND s.is_dummy_subscription = false)
+
+/* Final table  */
+
+SELECT DATE(Week_Start) as Week_Start, 
+       DATE(Month_Start) as Month_Start,
+       DATE(reporting_subscription_start_time) as reporting_subscription_start_time, 
+       DATE(subscription_end_time) as subscription_end_time,
+       label,
+       user_id, 
+       reporting_market,
+       country,
+       utm_source,
+       utm_medium,
+       plan_group,
+       payments_gbp,
+       gbp_m1
+FROM Subs_past_5_weeks_payments
+UNION ALL 
+SELECT DATE(Week_Start) as Week_Start, 
+       DATE(Month_Start) as Month_Start,
+       DATE(reporting_subscription_start_time) as reporting_subscription_start_time, 
+       DATE(subscription_end_time) as subscription_end_time,
+       label,
+       user_id, 
+       reporting_market,
+       country,
+       utm_source,
+       utm_medium,
+       plan_group,
+       payments_gbp,
+       gbp_m1
+FROM Trials_past_5_weeks
+
+
+
+
